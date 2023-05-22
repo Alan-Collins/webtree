@@ -1,0 +1,352 @@
+<html>
+  <head>
+    <title>Tree Viewer</title>
+    <meta charset="utf-8">
+    <link rel="stylesheet" href="https://pyscript.net/latest/pyscript.css" />
+    <script defer src="https://pyscript.net/latest/pyscript.js"></script>
+  </head>
+  <body>
+
+    <body>
+      <button py-click="plot()" id="plot" class="py-button">Plot the tree</button>
+      <p id="plot"></p>
+
+    <py-config>
+      packages = ["matplotlib", "numpy", "dendropy"]
+    </py-config>
+
+    <py-script>
+import numpy as np
+import matplotlib.pyplot as plt
+import dendropy
+import js
+from pyodide.http import open_url
+from pyodide.ffi import create_proxy
+
+
+def make_dist_mat(seqs):
+  """
+  Args:
+      seqs (list): List of sequences to be compared.
+      
+  Returns:
+      (numpy.array) numpy array of the pairwise distances between arrays.
+  """
+
+  n = len(seqs)
+
+  grid = np.zeros((n,n))
+      
+  # Iterate across all combinations of arrays
+  for i in range(n):
+      for j in range(i+1, n):
+          seq1 = seqs[i]
+          seq2 = seqs[j]
+
+          d = 0
+          for x, y in zip(seq1, seq2):
+              if x != y:
+                  d += 1
+          # Assign distance to both parts of symetrical distance matrix
+          grid[i][j] = d
+          grid[j][i] = d
+
+  return grid
+
+
+def make_q_mat(mat):
+  """ 
+  Make a matrix of Q values based on the formula on the wikipedia page https://en.wikipedia.org/wiki/Neighbor_joining
+  Q[i,j] = (n-2)d[i,j] - sum(d[i]) - sum(d[j]) 
+  Args:
+      mat (numpy.array): Matrix of pairwise distances.
+      
+  Returns:
+      (numpy.array) Matrix of pairwise Q values.
+  """
+
+  # make matrix of 0s to fill in
+  q = np.zeros(mat.shape)
+  n = mat.shape[0]
+
+  # Iterate across matrix
+  for i in range(n):
+      for j in range(i+1, n):
+          qval = (n-2)*mat[i,j] - sum(mat[i]) - sum(mat[j])
+          q[i,j] = qval
+          q[j,i] = qval
+
+
+  return q
+
+
+def find_best_pair(qmat):
+  """
+  Find the closest pair of items in a Q matrix
+  Args:
+      qmat (numpy.array): Matrix of Q values.
+      
+  Returns:
+      (tuple of ints) Index of the best scoring pair.
+  """
+
+  best_score = 999999
+  best_idx = 9999999
+
+  n = qmat.shape[0]
+  for i in range(n):
+      for j in range(i+1, n):
+          if qmat[i,j] < best_score:
+              best_score = qmat[i,j]
+              best_idx = (i,j)
+
+  return best_idx
+
+
+def make_new_dist_mat(old_mat, index):
+    """
+    Args:
+        oldmat (numpy.array): distance matrix used to find best pair.
+        index (tuple of ints): indices of best pair.
+        
+    Returns:
+        (numpy.array) New distance matrix with joined pair collapsed to a single row/column in the matrix.
+    """
+    old_n = old_mat.shape[0]
+    new_mat = np.zeros((old_n-1, old_n-1))
+    new_n = old_n-1
+
+    x = 1
+    y = 1
+
+    for i in range(old_n):
+        if i != index[0] and i != index[1]:
+            for j in range(old_n):
+                if j != index[0] and j != index[1]:
+                    new_mat[x][y] = old_mat[i][j]
+                    y += 1
+            y = 1
+            x += 1
+
+    for i in range(new_n):
+        new_mat[0,i] = (old_mat[index[0]][i+1] + old_mat[index[1]][i+1] - old_mat[index[0],index[1]])/2
+        new_mat[i,0] = (old_mat[index[0]][i+1] + old_mat[index[1]][i+1] - old_mat[index[0],index[1]])/2
+        
+    return new_mat
+
+
+def calc_dist_to_node(dmat, index):
+    i,j = index
+    if dmat.shape[0] != 2:
+        dist_i = (dmat[i][j])/2 + 1/(2*(dmat.shape[0]-2))*(sum(dmat[i])-sum(dmat[j]))
+    else:
+        dist_i = 0
+    dist_j = dmat[i][j] - dist_i
+
+    return dist_i, dist_j
+
+
+def read_csv_sts(url):
+    """
+    Args:
+        url (str): url to input csv file
+        
+    Returns:
+        (dict) dict of STs for each sample. {sample_name: [STs]}
+    """
+    sts = {}
+    with open_url(url) as opurl:
+        for line in opurl.readlines()[1:]:
+            bits = line.strip().split(",")
+            sts[bits[0]] = bits[1:]
+    return sts
+
+def yield_nodes(node):
+    """
+    Work through a tree or subtree, yield the taxon labels of nodes
+    
+    """
+    if node.is_internal():
+        # decide when to insert this node among its children
+        # Should be about half way through its list of child nodes
+        label_loc = int(len(node.child_nodes())/2)-1
+        for i, n in enumerate(node.child_nodes()):
+          for x in yield_nodes(n):
+            yield x
+          if i == label_loc:
+            yield node.taxon.label
+
+    else:
+        yield node.taxon.label
+
+def find_node_locs(tree, brlen_scale=0.5, branch_spacing=2):
+
+    node_list = [n for n in yield_nodes(tree.seed_node)]
+
+    node_locs = {}
+
+    # Prepare tree for root distance queries
+    tree.calc_node_root_distances(
+        return_leaf_distances_only=False)
+
+    for i, n in enumerate(node_list):
+        node = tree.find_node_with_taxon_label(n)
+        x_position = node.root_distance*brlen_scale
+        y_position = i*branch_spacing
+        node_locs[n] = (x_position, y_position)
+
+    return node_locs
+
+
+def draw_branches(tree, node_locs, ax, brlen_scale=1, line_scale=1):
+
+    for name, location in node_locs.items():
+        x, y = location
+        node = tree.find_node_with_taxon_label(name)
+        
+        # Draw branch from this node to its parent
+        
+        # identify x location for parent depth if the parent is not seed
+        if node != tree.seed_node and node.parent_node.taxon != None:
+            x2 = node_locs[node.parent_node.taxon.label][0]
+        else:
+            x2 = x - brlen_scale
+
+        ax.plot([x, x2], [y, y], color='black', linewidth=line_scale,
+            solid_capstyle="round")
+
+        # If internal node, draw line connecting lines to children
+        if node.is_internal():
+            child_locations = [
+                node_locs[i.taxon.label] for i in node.child_nodes()]
+            # Draw line between the highest and smallest child y value
+            y1 = max([i[1] for i in child_locations])
+            y2 = min([i[1] for i in child_locations])
+
+            ax.plot([x, x], [y1, y2], color='black', linewidth=line_scale,
+                solid_capstyle="round")
+
+
+
+def add_labels(tree, node_locs, ax, line_scale=1, label_text_size=10):
+
+    leaves = [i.taxon.label for i in tree.leaf_nodes()]
+        
+    for name, location in node_locs.items():
+        if name not in leaves:
+            # don't add internal labels
+            continue
+        
+        # Extract relevant node from tree
+        node = tree.find_node_with_taxon_label(name)
+        
+        # Add node label
+        x, y = location
+        label_color = "#000000"
+
+        # Draw labels at the most extreme x position (negativen number)
+        label_x = max([float(i[0]) for i in node_locs.values()])
+        # Draw dashed line from node to label for visual aid
+        ax.plot([label_x, x], [y,y], linestyle='--', color='black',
+            linewidth=line_scale*0.5, dashes=(10, 2), alpha=0.3)
+
+        ax.text(label_x+0.1, y, name, ha='right', va='center_baseline', 
+            fontsize=label_text_size, color=label_color)
+
+def main(data):
+  labels = [i for i in data.keys()]
+  sts = [i for i in data.values()]
+  dmat = make_dist_mat(sts)
+
+  while dmat.shape[0] > 1: # Keep joining neighbours until the tree is fully resolved
+      qmat = make_q_mat(dmat)
+      best_idx = find_best_pair(qmat)
+      dists = calc_dist_to_node(dmat, best_idx)
+      # To form a newick tree structure, combine the labels of the best_idx into a sublist in the list of labels
+      a = str(labels[best_idx[0]]).replace('[','(').replace(']',')').replace("'","")
+      b = str(labels[best_idx[1]]).replace('[','(').replace(']',')').replace("'","")
+      # newnode_labels = [["{}:{}".format(a, dists[0]), "{}:{}".format(b, dists[1])]]
+      newnode_labels = [["{}: 1".format(a), "{}: 1".format(b)]]
+      labels = newnode_labels + [i for i in labels if i != labels[best_idx[0]] and i != labels[best_idx[1]]]
+      dmat = make_new_dist_mat(dmat, best_idx)
+
+  # Convert sublists into newick format by replacing square brackets with parentheses
+  tree = str(labels)[1:-1].replace('[','(').replace(']',')').replace("'","")+';'
+
+  dtree = dendropy.Tree.get(data=tree, schema="newick")
+  n = 0
+  for node in dtree.postorder_node_iter():
+      try:
+          a = node.taxon.label
+      except:
+          new_taxon = dendropy.Taxon(f"int_{n}")
+          dtree.taxon_namespace.add_taxon(new_taxon)
+          node.taxon = new_taxon
+          n += 1
+          node.edge_length=1
+      
+  node_locs = find_node_locs(dtree)
+
+  fig, ax = plt.subplots(figsize=(3,3))
+
+  draw_branches(dtree, node_locs, ax)
+
+  add_labels(dtree, node_locs, ax)
+
+  plt.axis('off')
+  plt.tight_layout()
+  plt.margins(0,0)
+  fig.set_size_inches(3,3)
+  display(fig, target="graph-area", append=False)
+
+
+def plot():
+    url = "https://raw.githubusercontent.com/Alan-Collins/webtree/main/data.csv"
+    data = read_csv_sts(url)
+
+    current_selected = []
+    samples = js.document.getElementsByName("sample")
+
+    data_subset = {}
+    for ele in samples:
+      if not ele.checked:
+        continue
+      if ele.value == "ALL":
+        data_subset = data
+        break
+      
+      data_subset[ele.value] = data[ele.value]
+    main(data_subset)
+  
+
+    </py-script>
+
+    <div id="input" style="margin: 20px;">
+      Select samples to plot: <br/>
+      <input type="checkbox" id="all" name="sample" value="ALL">
+      <label for="all"> All </label>
+      <input type="checkbox" id="A" name="sample" value="A">
+      <label for="A"> A </label>
+      <input type="checkbox" id="B" name="sample" value="B">
+      <label for="B"> B </label>
+      <input type="checkbox" id="C" name="sample" value="C">
+      <label for="C"> C </label>
+      <input type="checkbox" id="D" name="sample" value="D">
+      <label for="D"> D </label>
+      <input type="checkbox" id="E" name="sample" value="E">
+      <label for="E"> E </label>
+      <input type="checkbox" id="F" name="sample" value="F">
+      <label for="F"> F </label>
+      <input type="checkbox" id="G" name="sample" value="G">
+      <label for="G"> G </label>
+      <input type="checkbox" id="H" name="sample" value="H">
+      <label for="H"> H </label>
+    </div>
+
+    <py-repl>
+      dummy_data
+    </py-repl>
+
+    <div id="graph-area"></div>
+  </body>
+</html>
