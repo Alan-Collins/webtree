@@ -19,147 +19,356 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import dendropy
+import re
 import js
+import random
 from pyodide.http import open_url
 from pyodide.ffi import create_proxy
 
 
-def make_dist_mat(seqs):
-  """
-  Args:
-      seqs (list): List of sequences to be compared.
-      
-  Returns:
-      (numpy.array) numpy array of the pairwise distances between arrays.
-  """
-
-  n = len(seqs)
-
-  grid = np.zeros((n,n))
-      
-  # Iterate across all combinations of arrays
-  for i in range(n):
-      for j in range(i+1, n):
-          seq1 = seqs[i]
-          seq2 = seqs[j]
-
-          d = 0
-          for x, y in zip(seq1, seq2):
-              if x != y:
-                  d += 1
-          # Assign distance to both parts of symetrical distance matrix
-          grid[i][j] = d
-          grid[j][i] = d
-
-  return grid
-
-
-def make_q_mat(mat):
-  """ 
-  Make a matrix of Q values based on the formula on the wikipedia page https://en.wikipedia.org/wiki/Neighbor_joining
-  Q[i,j] = (n-2)d[i,j] - sum(d[i]) - sum(d[j]) 
-  Args:
-      mat (numpy.array): Matrix of pairwise distances.
-      
-  Returns:
-      (numpy.array) Matrix of pairwise Q values.
-  """
-
-  # make matrix of 0s to fill in
-  q = np.zeros(mat.shape)
-  n = mat.shape[0]
-
-  # Iterate across matrix
-  for i in range(n):
-      for j in range(i+1, n):
-          qval = (n-2)*mat[i,j] - sum(mat[i]) - sum(mat[j])
-          q[i,j] = qval
-          q[j,i] = qval
-
-
-  return q
-
-
-def find_best_pair(qmat):
-  """
-  Find the closest pair of items in a Q matrix
-  Args:
-      qmat (numpy.array): Matrix of Q values.
-      
-  Returns:
-      (tuple of ints) Index of the best scoring pair.
-  """
-
-  best_score = 999999
-  best_idx = 9999999
-
-  n = qmat.shape[0]
-  for i in range(n):
-      for j in range(i+1, n):
-          if qmat[i,j] < best_score:
-              best_score = qmat[i,j]
-              best_idx = (i,j)
-
-  return best_idx
-
-
-def make_new_dist_mat(old_mat, index):
+def read_profile_from_url(url, samples):
     """
     Args:
-        oldmat (numpy.array): distance matrix used to find best pair.
-        index (tuple of ints): indices of best pair.
+        url (str): url to input file
         
     Returns:
-        (numpy.array) New distance matrix with joined pair collapsed to a single row/column in the matrix.
+        np.Array
     """
-    old_n = old_mat.shape[0]
-    new_mat = np.zeros((old_n-1, old_n-1))
-    new_n = old_n-1
+    names, profiles = [], []
+    opurl = open_url(url).readlines()
+    for line_id, line in enumerate(opurl):
+        if line.startswith('#') :
+            if not line.startswith('##') :
+                header = line.strip().split('\t')
+                allele_cols = np.array([ id for id, col in enumerate(header) if id > 0 and not col.startswith('#') and not col.lower() in {'st_id', 'st'} ])
+            continue
 
-    x = 1
-    y = 1
+        if allele_cols is None :
+            header = line.strip().split('\t')
+            allele_cols = np.array([ id for id, col in enumerate(header) if id > 0 and not col.startswith('#') and not col.lower() in {'st_id', 'st'} ])
+            line_id += 1
+        break
 
-    for i in range(old_n):
-        if i != index[0] and i != index[1]:
-            for j in range(old_n):
-                if j != index[0] and j != index[1]:
-                    new_mat[x][y] = old_mat[i][j]
-                    y += 1
-            y = 1
-            x += 1
+    for line in opurl[line_id:] :
+        part = line.strip().split('\t')
+        if not part[0]:
+            continue
+        if part[0] not in samples:
+            continue
+        names.append(part[0])
+        if allele_cols is not None :
+            profiles.append(np.array(part)[allele_cols])
+        else :
+            profiles.append(part[1:])
+    profiles = np.char.upper(np.array(profiles, dtype=str))
+    names = [re.sub(r'[\(\)\ \,\"\';]', '_', n) for n in names]
 
-    for i in range(new_n):
-        new_mat[0,i] = (old_mat[index[0]][i+1] + old_mat[index[1]][i+1] - old_mat[index[0],index[1]])/2
-        new_mat[i,0] = (old_mat[index[0]][i+1] + old_mat[index[1]][i+1] - old_mat[index[0],index[1]])/2
+    return names, profiles
+
+
+def nonredundant(names, profiles) :
+    encoded_profile = np.array([np.unique(p, return_inverse=True)[1]+1 for p in profiles.T]).T
+    encoded_profile[ (profiles == '0') | (profiles == 'N') | (profiles == '-')] = 0
+    if params['handle_missing'] == 'complete_delete' :
+        encoded_profile = encoded_profile[:, np.sum(encoded_profile == 0, 0) > 0]
+    names = names[np.lexsort(encoded_profile.T)]
+    profiles = encoded_profile[np.lexsort(encoded_profile.T)]
+    presence = (np.sum(profiles > 0, 1) > 0)
+    names, profiles = names[presence], profiles[presence]
+
+    uniqueness = np.concatenate([[1], np.sum(np.diff(profiles, axis=0) != 0, 1) > 0])
+
+    embeded = {names[0]:[]}
+    embeded_group = embeded[names[0]]
+    for n, u in zip(names, uniqueness) :
+        if u == 0 :
+            embeded_group.append(n)
+        else :
+            embeded[n] = [n]
+            embeded_group = embeded[n]
+    names = names[uniqueness>0]
+    profiles = profiles[uniqueness>0]
+    return names, profiles, embeded
+
+
+def prims(dist):
+    # MS tree from symmetrical distance matrix
+
+    dist = np.maximum(dist, dist.T)
+    high_val = np.max(dist) + 1
+
+    #set up indxs
+    orig_idxs = set([i for i in range(dist.shape[0])])
+    used_idxs = set()
+
+    #make arrays
+    orig_d = np.copy(dist)
+    np.fill_diagonal(orig_d, high_val)
+    temp_d = np.full(shape=(dist.shape[0], dist.shape[1]), dtype=np.float32, fill_value=high_val)
+    new_d = np.zeros(shape=(dist.shape[0]-1, 3), dtype=np.float32)
+    minima = {}
+    
+    idx = random.choice([i for i in orig_idxs - used_idxs])
+    used_idxs.add(idx)
+    temp_d[idx, :] = orig_d[idx, :]
+    minima[idx] = np.amin(temp_d[idx, :])
+    x = 0
+    while len(used_idxs) < len(orig_idxs):
+        best_idx, best_edge = sorted([(k,np.amin(v)) for k,v in minima.items()], key = lambda x: x[1])[0]
+        mate_node = np.argmin(temp_d[best_idx,:])
+        used_idxs.add(mate_node)
+        new_d[x] = np.array([best_idx, mate_node, best_edge])
+        x += 1
+        temp_d[mate_node, :] = orig_d[mate_node, :]
+        for idx in used_idxs:
+            temp_d[idx,mate_node] = high_val +1
+            temp_d[mate_node, idx] = high_val +1
+            minima[idx] = np.amin(temp_d[idx, :])
+
+    return new_d
+
+
+
+def contemporary(a,b,c, n_loci) :
+    a[0], a[1] = max(min(a[0], n_loci-0.5), 0.5), max(min(a[1], n_loci-0.5), 0.5);
+    b, c = max(min(b, n_loci-0.5), 0.5), max(min(c, n_loci-0.5), 0.5)
+    if b >= a[0] + c and b >= a[1] + c :
+        return False
+    elif b == c :
+        return True
+    s11, s12 = np.sqrt(1-a[0]/n_loci), (2*n_loci - b - c)/2/np.sqrt(n_loci*(n_loci-a[0]))
+    v = 1-((n_loci-a[1])*(n_loci-c)/n_loci+(n_loci-b))/2/n_loci
+    s21, s22 = 1+a[1]*v/(b-2*n_loci*v), 1+c*v/(b-2*n_loci*v)
+
+    p1 = a[0]*np.log(1-s11*s11) + (n_loci-a[0])*np.log(s11*s11) + (b+c)*np.log(1-s11*s12) + (2*n_loci-b-c)*np.log(s11*s12)
+    p2 = a[1]*np.log(1-s21) + (n_loci-a[1])*np.log(s21) + b*np.log(1-s21*s22) + (n_loci-b)*np.log(s21*s22) + c*np.log(1-s22) + (n_loci-c)*np.log(s22)
+    return p1 >= p2
+
+
+class methods() :
+    @staticmethod
+    def _asymmetric(dist, weight, **params) :
+        def get_shortcut(dist, weight, cutoff=20) :
+            if dist.shape[0] < 3000 :
+                cutoff = 2
+            elif dist.shape[0] < 10000 :
+                cutoff = 5
+            elif dist.shape[0] < 30000 :
+                cutoff = 10
+            link = np.array(np.where(dist < (cutoff+1) ))
+            link = link.T[weight[link[0]] < weight[link[1]]].T
+            link = np.vstack([link, dist[tuple(link.tolist())] + weight[link[0]]])
+            link = link.T[np.lexsort(link)]
+            return link[np.unique(link.T[1], return_index=True)[1]].astype(int)
+
+        presence = np.arange(weight.shape[0])
+        shortcuts = get_shortcut(dist, weight)
+        for (s, t, d) in shortcuts :
+            dist[s, dist[s] > dist[t]] = dist[t, dist[s] > dist[t]]
+        presence[shortcuts.T[1]] = -1
+        dist = dist.T[presence >= 0].T[presence >= 0]
+        presence = presence[presence >=0]
+        weight2 = weight[presence]
+        dist = np.round(dist, 0) + weight2.reshape([weight2.size, -1])
+        np.fill_diagonal(dist, 0.0)
+        mstree = prims(dist).astype(int)
+        assert mstree.size > 0
+        mstree.T[2] -= 1
+        mstree.T[:2] = presence[mstree.T[:2]]
         
-    return new_mat
+        return mstree.tolist() + shortcuts.tolist()
 
 
-def calc_dist_to_node(dmat, index):
-    i,j = index
-    if dmat.shape[0] != 2:
-        dist_i = (dmat[i][j])/2 + 1/(2*(dmat.shape[0]-2))*(sum(dmat[i])-sum(dmat[j]))
-    else:
-        dist_i = 0
-    dist_j = dmat[i][j] - dist_i
+    @staticmethod
+    def _branch_recraft(branches, dist, weights, n_loci) :
 
-    return dist_i, dist_j
+        if n_loci is None :
+            n_loci = np.max(dist)
 
+        group_id, groups, childrens = {b:b for br in branches for b in br[:2]}, \
+            {b:[b] for br in branches for b in br[:2]}, \
+            {b:[] for br in branches for b in br[:2]}
+        branches = sorted(branches, key=lambda br:[dist[br[0], br[1]]] + sorted([weights[br[0]], weights[br[1]]]))
+        i = 0
+        while i < len(branches) :
+            src, tgt, brlen = branches[i]
 
-def read_csv_sts(url):
-    """
-    Args:
-        url (str): url to input csv file
+            sources, targets = groups[group_id[src]], groups[group_id[tgt]]
+            tried = {}
+            if len(sources) > 1 :
+                for w, d, s in sorted(zip(weights[sources], dist[sources, tgt], sources))[:3] :
+                    if s == src : break
+                    if d < 1.5*dist[src, tgt] :
+                        if contemporary([dist[s, src], dist[src, s]], d, dist[src, tgt], n_loci) :
+                            tried[src], src = s, s
+                            break
+                while src not in tried :
+                    tried[src] = src
+                    mid_nodes = sorted([[weights[s], dist[s,tgt], s] for s in childrens[src] if s not in tried and dist[s,tgt] < 2*dist[src, tgt]])
+                    for w, d, s in mid_nodes :
+                        if d < dist[src, tgt] :
+                            if not contemporary([dist[src, s], dist[s, src]], dist[src, tgt], d, n_loci) :
+                                tried[src], src = s, s
+                                break
+                        elif w < weights[src] :
+                            if contemporary([dist[s, src], dist[src, s]], d, dist[src, tgt], n_loci) :
+                                tried[src], src = s, s
+                                break
+                        tried[s] = src
+            if len(targets) > 1 :
+                for w, d, t in sorted(zip(weights[targets], dist[src, targets], targets))[:3] :
+                    if t == tgt : break
+                    if d < 1.5*dist[src, tgt] :
+                        if contemporary([dist[t, tgt], dist[tgt, t]], d, dist[src, tgt], n_loci) :
+                            tried[tgt], tgt = t, t
+                            break
+                while tgt not in tried :
+                    tried[tgt] = tgt
+                    mid_nodes = sorted([[weights[t], dist[src,t], t] for t in childrens[tgt] if t not in tried and dist[src, t] < 2*dist[src, tgt]])
+                    for w, d, s in mid_nodes :
+                        if d < dist[src, tgt] :
+                            if not contemporary([dist[tgt, t], dist[t, tgt]], dist[src, tgt], d, n_loci) :
+                                tried[tgt], tgt = t, t
+                                break
+                        elif w < weights[tgt] :
+                            if contemporary([dist[t, tgt], dist[tgt, t]], d, dist[src, tgt], n_loci) :
+                                tried[tgt], tgt = t, t
+                                break
+                        tried[t] = tgt
+            brlen = dist[src, tgt]
+            branches[i] = [src, tgt, brlen]
+            if i >= len(branches) - 1 or branches[i+1][2] >= brlen:
+                tid = group_id[tgt]
+                for t in targets :
+                    group_id[t] = group_id[src]
+                groups[group_id[src]].extend(groups.pop(tid, []))
+                childrens[src].append(tgt)
+                childrens[tgt].append(src)
+                i += 1
+            else :
+                branches[i:] = sorted(branches[i:], key=lambda br:br[2])
+        return branches
+
+    @staticmethod
+    def _network2tree(branches, names) :
+        branches.sort(key=lambda x:x[2], reverse=True)
+        branch = []
+        in_use = {branches[0][0]:1}
+        while len(branches) :
+            remain = []
+            for br in branches :
+                if br[0] in in_use :
+                    branch.append(br)
+                    in_use[br[1]] = 1
+                elif br[1] in in_use :
+                    branch.append([br[1], br[0], br[2]])
+                    in_use[br[0]] = 1
+                else :
+                    remain.append(br)
+            branches = remain
+
+        seed_node = dendropy.Node(label=names[branch[0][0]], edge_length=0)
+        nodeFinder = {names[branch[0][0]]: seed_node}
+        tre = dendropy.Tree(seed_node=seed_node)
+
+        for src, tgt, dif in branch:
+            if names[tgt] in nodeFinder:
+                tgt_node = nodeFinder[names[tgt]]
+                tgt_node.edge_length = dif
+            else:
+                tgt_node = dendropy.Node(label=names[tgt], edge_length=dif)
+                nodeFinder[names[tgt]] = tgt_node
+            if names[src] in nodeFinder:
+                src_node = nodeFinder[names[src]]
+            else:
+                src_node = dendropy.Node(label=names[src], edge_length=-1)
+            src_node.add_child(tgt_node)
+
+        # resolve internal leaves
+        int_id = 0
+        for node in tre.preorder_internal_node_iter():
+            label = node.label
+            node.label = 'int_node_{}'.format(int_id)
+            int_id += 1
+            node.add_child(dendropy.Node(label=label, edge_length=0))
         
-    Returns:
-        (dict) dict of STs for each sample. {sample_name: [STs]}
-    """
-    sts = {}
-    with open_url(url) as opurl:
-        for line in opurl.readlines()[1:]:
-            bits = line.strip().split(",")
-            sts[bits[0]] = bits[1:]
-    return sts
+        return tre
+
+
+    @staticmethod
+    def MSTree(names, profiles, embeded, matrix_type='asymmetric', heuristic='harmonic', branch_recraft=True, handle_missing='pair_delete', **params) :
+        n_loci = profiles.shape[1]
+        dist = distance_matrix.get_distance(matrix_type, profiles, handle_missing)
+        weight = eval('distance_matrix.'+heuristic)(dist, [len(embeded[n]) for n in names])
+
+        tree = eval('methods._'+matrix_type)(dist, weight, **params)
+        # del dist
+        if branch_recraft :
+            tree = methods._branch_recraft(tree, dist, weight, n_loci)
+        if matrix_type != 'blockwise' :
+            tree = distance_matrix.symmetric_link(profiles, tree, handle_missing= handle_missing)
+        tree = methods._network2tree(tree, names)
+        return tree
+
+
+def parallel_distance(callup) :
+    func, profiles, handle_missing, index_range = callup
+    res = eval('distance_matrix.'+func)(profiles, handle_missing, index_range)
+
+    return res
+
+
+class distance_matrix() :
+    @staticmethod
+    def get_distance(func, profiles, handle_missing) :
+        n_profile, n_allele = profiles.shape
+        res = parallel_distance([func, profiles, handle_missing, [0, n_profile]])
+        if func == 'symmetric' :
+            res[res.T > res] = res.T[res.T > res]
+        return res
+
+
+    @staticmethod
+    def symmetric_link(profiles, links, handle_missing = 'pair_delete') :
+        if handle_missing in ('as_allele', ) :
+            presences = np.ones(shape=profiles.shape, dtype=int)
+        elif handle_missing in ('pair_delete', 'absolute_distance') :
+            presences = (profiles > 0)
+        else :
+            presences = np.repeat(np.sum(profiles >0, 0) >= profiles.shape[0], profiles.shape[0]).reshape([profiles.shape[1], profiles.shape[0]]).T
+
+        return [ [ s, t, np.sum((profiles[s] != profiles[t]) & presences[s] & presences[t]) ] \
+                 for s, t, d in links ]
+
+
+    @staticmethod
+    def asymmetric(profiles, handle_missing = 'pair_delete', index_range=None) :
+        if index_range is None :
+            index_range = [0, profiles.shape[0]]
+
+        presences = (profiles > 0)
+        distances = np.zeros(shape=[profiles.shape[0], index_range[1] - index_range[0]], dtype=np.float32)
+        
+        if handle_missing not in ('absolute_distance', ) :
+            for i2, id in enumerate(np.arange(*index_range)) :
+                profile, presence = profiles[id], presences[id]
+                diffs = np.sum(((profiles != profile) & presence), axis=1) * float(presence.size)/np.sum(presence)
+                distances[:, i2] = diffs
+        else :
+            for i2, id in enumerate(np.arange(*index_range)) :
+                profile, presence = profiles[id], presences[id]
+                diffs = np.sum((profiles != profile) & presence, axis=1)
+                distances[:, i2] = diffs
+        return distances
+
+
+    @staticmethod
+    def harmonic(dist, n_str) :
+        weights = dist.shape[0] / np.sum(1.0/(dist + 0.1), 1)
+        cw = np.vstack([-np.array(n_str), weights])
+        weights[np.lexsort(cw)] = np.arange(dist.shape[0], dtype=float)/dist.shape[0]
+        return weights
+
 
 def yield_nodes(node):
     """
@@ -174,25 +383,31 @@ def yield_nodes(node):
           for x in yield_nodes(n):
             yield x
           if i == label_loc:
-            yield node.taxon.label
+            yield node.label
 
     else:
-        yield node.taxon.label
+        yield node.label
 
 def find_node_locs(tree, brlen_scale=0.5, branch_spacing=2):
 
     node_list = [n for n in yield_nodes(tree.seed_node)]
-
     node_locs = {}
 
     # Prepare tree for root distance queries
     tree.calc_node_root_distances(
         return_leaf_distances_only=False)
 
+    int_mod = 0
     for i, n in enumerate(node_list):
-        node = tree.find_node_with_taxon_label(n)
+        node = tree.find_node_with_label(n)
         x_position = node.root_distance*brlen_scale
-        y_position = i*branch_spacing
+        y_position = (i-int_mod)*branch_spacing
+        print(node.label)
+        if node.is_internal():
+            print(y_position)
+            y_position -= branch_spacing/2
+            int_mod += 1
+            print(y_position)
         node_locs[n] = (x_position, y_position)
 
     return node_locs
@@ -202,13 +417,13 @@ def draw_branches(tree, node_locs, ax, brlen_scale=1, line_scale=1):
 
     for name, location in node_locs.items():
         x, y = location
-        node = tree.find_node_with_taxon_label(name)
+        node = tree.find_node_with_label(name)
         
         # Draw branch from this node to its parent
         
         # identify x location for parent depth if the parent is not seed
-        if node != tree.seed_node and node.parent_node.taxon != None:
-            x2 = node_locs[node.parent_node.taxon.label][0]
+        if node != tree.seed_node and node.parent_node != None:
+            x2 = node_locs[node.parent_node.label][0]
         else:
             x2 = x - brlen_scale
 
@@ -218,7 +433,7 @@ def draw_branches(tree, node_locs, ax, brlen_scale=1, line_scale=1):
         # If internal node, draw line connecting lines to children
         if node.is_internal():
             child_locations = [
-                node_locs[i.taxon.label] for i in node.child_nodes()]
+                node_locs[i.label] for i in node.child_nodes()]
             # Draw line between the highest and smallest child y value
             y1 = max([i[1] for i in child_locations])
             y2 = min([i[1] for i in child_locations])
@@ -227,10 +442,9 @@ def draw_branches(tree, node_locs, ax, brlen_scale=1, line_scale=1):
                 solid_capstyle="round")
 
 
-
 def add_labels(tree, node_locs, ax, line_scale=1, label_text_size=10):
 
-    leaves = [i.taxon.label for i in tree.leaf_nodes()]
+    leaves = [i.label for i in tree.leaf_nodes()]
         
     for name, location in node_locs.items():
         if name not in leaves:
@@ -250,74 +464,61 @@ def add_labels(tree, node_locs, ax, line_scale=1, label_text_size=10):
         ax.plot([label_x, x], [y,y], linestyle='--', color='black',
             linewidth=line_scale*0.5, dashes=(10, 2), alpha=0.3)
 
-        ax.text(label_x+0.1, y, name, ha='right', va='center_baseline', 
+        ax.text(label_x+0.1, y, name, ha='left', va='center_baseline', 
             fontsize=label_text_size, color=label_color)
 
-def main(data):
-  labels = [i for i in data.keys()]
-  sts = [i for i in data.values()]
-  dmat = make_dist_mat(sts)
-
-  while dmat.shape[0] > 1: # Keep joining neighbours until the tree is fully resolved
-      qmat = make_q_mat(dmat)
-      best_idx = find_best_pair(qmat)
-      dists = calc_dist_to_node(dmat, best_idx)
-      # To form a newick tree structure, combine the labels of the best_idx into a sublist in the list of labels
-      a = str(labels[best_idx[0]]).replace('[','(').replace(']',')').replace("'","")
-      b = str(labels[best_idx[1]]).replace('[','(').replace(']',')').replace("'","")
-      # newnode_labels = [["{}:{}".format(a, dists[0]), "{}:{}".format(b, dists[1])]]
-      newnode_labels = [["{}: 1".format(a), "{}: 1".format(b)]]
-      labels = newnode_labels + [i for i in labels if i != labels[best_idx[0]] and i != labels[best_idx[1]]]
-      dmat = make_new_dist_mat(dmat, best_idx)
-
-  # Convert sublists into newick format by replacing square brackets with parentheses
-  tree = str(labels)[1:-1].replace('[','(').replace(']',')').replace("'","")+';'
-
-  dtree = dendropy.Tree.get(data=tree, schema="newick")
-  n = 0
-  for node in dtree.postorder_node_iter():
-      try:
-          a = node.taxon.label
-      except:
-          new_taxon = dendropy.Taxon(f"int_{n}")
-          dtree.taxon_namespace.add_taxon(new_taxon)
-          node.taxon = new_taxon
-          n += 1
-          node.edge_length=1
-      
-  node_locs = find_node_locs(dtree)
-
-  fig, ax = plt.subplots(figsize=(3,3))
-
-  draw_branches(dtree, node_locs, ax)
-
-  add_labels(dtree, node_locs, ax)
-
-  plt.axis('off')
-  plt.tight_layout()
-  plt.margins(0,0)
-  fig.set_size_inches(3,3)
-  display(fig, target="graph-area", append=False)
-
-
 def plot():
-    url = "https://raw.githubusercontent.com/Alan-Collins/webtree/main/data.csv"
-    data = read_csv_sts(url)
-
-    current_selected = []
+    
+    selected = set()
     samples = js.document.getElementsByName("sample")
-
-    data_subset = {}
+    
+    all_checked = False
     for ele in samples:
-      if not ele.checked:
-        continue
-      if ele.value == "ALL":
-        data_subset = data
-        break
-      
-      data_subset[ele.value] = data[ele.value]
-    main(data_subset)
+        if not ele.checked:
+            continue
+        else:
+            if ele.value == "ALL":
+                all_checked = True
+                break
+            selected.add(ele.value)
+    if all_checked:
+        for ele in samples:
+            if ele.value == "ALL":
+                continue
+            selected.add(ele.value)
+    
+    url = "https://raw.githubusercontent.com/Alan-Collins/webtree/grapetree/Salm_10_uniq.txt"
+    names, profiles = read_profile_from_url(url, selected)
+
+    names, profiles, embeded = nonredundant(np.array(names), np.array(profiles))
+    
+    tre = eval('methods.' + params['method'])(names, profiles, embeded, **params)
+    node_locs = find_node_locs(tre)
+    
+    fig, ax = plt.subplots(figsize=(3,3))
+    
+    draw_branches(tre, node_locs, ax)
+    
+    add_labels(tre, node_locs, ax)
+    
+    plt.axis('off')
+    plt.tight_layout()
+    plt.margins(0,0)
+    fig.set_size_inches(3,3)
+    display(fig, target="graph-area", append=False)
+    print(tre.length())
+
+    
   
+params = dict(method='MSTree', # MSTree , NJ
+              matrix_type='asymmetric',
+              heuristic = 'harmonic',
+              handle_missing = 'pair_delete', # complete_delete , absolute_distance , as_allele
+              branch_recraft=True,
+              wgMLST = False,
+              n_proc = 5,
+              checkEnv = False
+             )
 
     </py-script>
 
@@ -325,22 +526,26 @@ def plot():
       Select samples to plot: <br/>
       <input type="checkbox" id="all" name="sample" value="ALL">
       <label for="all"> All </label>
-      <input type="checkbox" id="A" name="sample" value="A">
-      <label for="A"> A </label>
-      <input type="checkbox" id="B" name="sample" value="B">
-      <label for="B"> B </label>
-      <input type="checkbox" id="C" name="sample" value="C">
-      <label for="C"> C </label>
-      <input type="checkbox" id="D" name="sample" value="D">
-      <label for="D"> D </label>
-      <input type="checkbox" id="E" name="sample" value="E">
-      <label for="E"> E </label>
-      <input type="checkbox" id="F" name="sample" value="F">
-      <label for="F"> F </label>
-      <input type="checkbox" id="G" name="sample" value="G">
-      <label for="G"> G </label>
-      <input type="checkbox" id="H" name="sample" value="H">
-      <label for="H"> H </label>
+      <input type="checkbox" id="SAL_BA9424AA" name="sample" value="SAL_BA9424AA">
+      <label for="SAL_BA9424AA"> SAL_BA9424AA </label>
+      <input type="checkbox" id="SAL_BA5832AA" name="sample" value="SAL_BA5832AA">
+      <label for="SAL_BA5832AA"> SAL_BA5832AA </label>
+      <input type="checkbox" id="SAL_FA5215AA" name="sample" value="SAL_FA5215AA">
+      <label for="SAL_FA5215AA"> SAL_FA5215AA </label>
+      <input type="checkbox" id="SAL_FA5911AA" name="sample" value="SAL_FA5911AA">
+      <label for="SAL_FA5911AA"> SAL_FA5911AA </label>
+      <input type="checkbox" id="SAL_CA4817AA" name="sample" value="SAL_CA4817AA">
+      <label for="SAL_CA4817AA"> SAL_CA4817AA </label>
+      <input type="checkbox" id="SAL_BA6623AA" name="sample" value="SAL_BA6623AA">
+      <label for="SAL_BA6623AA"> SAL_BA6623AA </label>
+      <input type="checkbox" id="SAL_KA0707AA" name="sample" value="SAL_KA0707AA">
+      <label for="SAL_KA0707AA"> SAL_KA0707AA </label>
+      <input type="checkbox" id="SAL_GA3475AA" name="sample" value="SAL_GA3475AA">
+      <label for="SAL_GA3475AA"> SAL_GA3475AA </label>
+      <input type="checkbox" id="SAL_DA8765AA" name="sample" value="SAL_DA8765AA">
+      <label for="SAL_DA8765AA"> SAL_DA8765AA </label>
+      <input type="checkbox" id="SAL_BA9258AA" name="sample" value="SAL_BA9258AA">
+      <label for="SAL_BA9258AA"> SAL_BA9258AA </label>
     </div>
 
     <py-repl>
