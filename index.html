@@ -402,12 +402,9 @@ def find_node_locs(tree, brlen_scale=0.5, branch_spacing=2):
         node = tree.find_node_with_label(n)
         x_position = node.root_distance*brlen_scale
         y_position = (i-int_mod)*branch_spacing
-        print(node.label)
         if node.is_internal():
-            print(y_position)
             y_position -= branch_spacing/2
             int_mod += 1
-            print(y_position)
         node_locs[n] = (x_position, y_position)
 
     return node_locs
@@ -506,7 +503,6 @@ def plot():
     plt.margins(0,0)
     fig.set_size_inches(3,3)
     display(fig, target="graph-area", append=False)
-    print(tre.length())
 
     
   
